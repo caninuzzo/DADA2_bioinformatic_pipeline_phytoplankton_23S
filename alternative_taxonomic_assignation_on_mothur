@@ -1,0 +1,92 @@
+Here 2 chunks from Rmarkdown script to assign ASV with mothur from R (work only with Linux!)
+
+It requires: 
+- reference database suitable with mothur (downloadable on phytool)
+- the script .sh which can be found at the end of this document (see file named "assignTaxonomyMothur.sh")
+
+The first chunk here (line 12) reformat outputs of DADA2 treatment after chimera removal in the perspective of ASV assignation
+
+The second chunk (line 40) performs the taxonomic assignation by calling the .sh script.
+
+
+**Prepare sequence table (without chimera) for taxonomic assignation with mothur**
+```{r 9_sequence_table_preparation_for_tax_assignment}
+library(ape) # for write.FASTA (available with DNABin class) which is the best* format of sequences FASTA (*the one I prefer to use)
+library(Biostrings) # for DNAStringSet which allows to be then converted properly by as.DNABin
+
+# creates FASTA file from seqtable without chimera
+dna.seqs <- DNAStringSet(getSequences(seqtab.nochim))
+
+# the reads are (hopefully) in the same order in fasta and in seqtable
+names(dna.seqs) <- paste0(rep("asv",length(dna.seqs)),seq(1:length(dna.seqs)))
+  
+# save as fasta file
+write.FASTA(as.DNAbin(dna.seqs),paste0(path_results,"/resulting_ASV.fasta"))
+  
+# add also "ASVx" to the sequences table
+ASV <- paste0(rep("asv",ncol(seqtab.nochim)),
+         seq(1:ncol(seqtab.nochim)))
+
+seqtab.nochim <- rbind(seqtab.nochim,ASV)
+  
+# save sequences table :
+write.table(seqtab.nochim,sep=";",quote=F,
+    paste0(path_results,"/seqtab_nochim.txt"))
+
+```
+
+
+**Taxonomic assignation with Mothur**
+```{r 10_taxonomic_assignment}
+### prepare input files to call (ref. (phytool) database) :
+refPath <- paste0(path,"/mothur/")
+phytool_header <- c("ASV","Kingdom","Phylum","Class","Order","Family","Genus","Genus_species","Synonym")
+
+# to execute command in system
+assignation <- "~/./assignTaxonomyMothur.sh"
+
+
+### define arguments
+# -seq : (ASV : fasta file) 
+argASV <- paste0(path_results,"/resulting_ASV.fasta")
+      
+# -ref : (mothur reference file) (.fasta)
+argRef <- paste0(refPath,"*.fasta")
+        
+# -tax : (mothur reference file)  (.tax)
+argTax <- paste0(refPath,"*.tax")
+        
+### launch Mothur command
+system(paste0(assignation,
+                " -s ",argASV,
+                " -r ",argRef,
+                " -t ",argTax))
+  
+
+### load output :
+ass.tab <- read.table(paste0(path_results,"/assignation_table.txt"),
+                    header=F,sep = ";",col.names = phytool_header,
+                    row.names = "ASV")
+
+### NA when no Synonym associated to Genus_species
+ass.tab[str_which(ass.tab$Synonym,"unclassified"),"Synonym"] <- NA
+
+### reformat seqtab to fit with merging
+seqtab.ref <- as.data.frame(t(seqtab.nochim))
+rownames(seqtab.ref) <- seqtab.ref$ASV
+seqtab.ref <- seqtab.ref[,-ncol(seqtab.ref)]
+  
+seqtab.ref[] <- sapply(seqtab.ref,as.numeric)
+
+### write & save table
+fullassseq_tab <- merge(ass.tab,seqtab.ref,by=0)
+rownames(fullassseq_tab) <- fullassseq_tab[,1]
+fullassseq_tab <- fullassseq_tab[,-1]
+
+write.table(fullassseq_tab,
+              paste0(path_results,"/complete_assseq_table.txt"),
+              sep = ";",quote=F,row.names = T)
+
+
+
+```
