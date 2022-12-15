@@ -1,0 +1,498 @@
+---
+title: "Metabarcoding formation"
+subtitle: "DADA2 bioinformatic pipeline for phytoplankton metabarcoding for 23S (UPA region)"
+output: html_notebook
+date: "`r format(Sys.time(), '%d %B %Y')`"
+---
+
+--------------------------------------------------------------------------------
+--------------------------------------------------------------------------------
+
+**CHUNK 1**  
+Load required packages
+```{r}
+library(dada2)
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+```
+
+---
+
+**CHUNK 2**  
+Define paths were the FASTQ files are located or will be gathered after each steps  
+*N.B.: In this case the FASTQ are and already sent demultiplexed by the platform, we thus do not have to do the demultiplexing step!*
+```{r}
+# clean the environment / remove everything
+rm(list=ls())
+
+# path to the raw data:
+path <- "<path to raw data (FASTQ)>" # "C:/User/(...)" path to folder for Windows!
+# list of the files present in the path:
+list.files(path)
+
+# path to the data once the primers were detected and removed:
+path_cut <- "<path to raw data which have been processed by cutadapt>"
+if(!dir.exists(path_cut)) dir.create(path_cut)
+
+# path to the data after filtration of the reads
+path_filt <- "<path to data after being processed by filterAndTrim command (reads filtering)>"
+if(!dir.exists(path_filt)) dir.create(path_filt)
+
+# create a directory to keep a sum up of the different steps done
+path_sum <- "<path to the folder which gathers overview of each bioinformatic steps>"
+if(!dir.exists(path_sum)) dir.create(path_sum)
+
+# create a directory for final outputs of the pipeline
+path_results <- "<path to the folder which gathers final outputs>"
+if(!dir.exists(path_results)) dir.create(path_results)
+```
+
+---
+
+**CHUNK 3**  
+Assign different names to forward and reverse corresponding FASTQ files and extract samples names
+```{r}
+raw_F_reads <- sort(list.files(path, pattern="_R1.fastq.gz", full.names = TRUE))
+raw_R_reads <- sort(list.files(path, pattern="_R2.fastq.gz", full.names = TRUE))
+# Extract sample names, assuming filenames have format: SAMPLENAME_XXX.fastq
+sample_names <- sapply(strsplit(basename(raw_F_reads),"_"), function(x) x[1])
+```
+
+---
+
+**CHUNK 4**  
+Remove primers using cutadapt command (use python from system)
+Installing cutadapt on Windows: https://cutadapt.readthedocs.io/en/stable/installation.html#installation-on-windows  
+Caution: for running cutadapt from Windows, code lines calling system may change,  
+consider using the ones below in the chunk ("designed for Windows").
+```{r}
+#### Load primers couples ####
+# 23S_UPA Forward primer:
+Fwd <- "ACAGWAAGACCCTATGAAGCTT"
+Fwd_RC <- dada2::rc(Fwd)
+
+# 23S_UPA Reverse primer:
+Rv <- "CCTGTTATCCCTAGAGTAACTT"
+Rv_RC <- dada2::rc(Rv)
+
+#### Prepare arguments of the command ####
+# outputs (data with primers removed):
+cut_F_reads <- file.path(path_cut, basename(raw_F_reads))
+cut_R_reads <- file.path(path_cut, basename(raw_R_reads))
+
+# arguments for primers detection (see Cutadapt website)
+R1_flags <- paste(paste("-g", Fwd, collapse = " "), paste("-a", Rv_RC, collapse = " "))
+R2_flags <- paste(paste("-G", Rv, collapse = " "), paste("-A", Fwd_RC, collapse = " "))
+
+# cutadapt command (run through Linux system // for Windows modify 'cutadapt' with the corresponding path
+cutadapt <- "cutadapt" # Path to the executable
+for(i in seq_along(raw_F_reads)) {
+  cat("Processing", "-----------", i, "/", length(raw_F_reads), "-----------\n")
+  system2(cutadapt, args = c(R1_flags, R2_flags,
+                             "--discard-untrimmed",
+                             "--max-n 0",
+                             # Optional strong constraint on expected length
+                             #paste0("-m ", 250-nchar(FWD)[1], ":", 250-nchar(REV)[1]), 
+                             #paste0("-M ", 250-nchar(FWD)[1], ":", 250-nchar(REV)[1]), 
+                             "-o", cut_F_reads[i], "-p", cut_R_reads[i],
+                             raw_F_reads[i], raw_R_reads[i]))
+}
+```
+
+---
+
+**CHUNK 5**  
+Gathering output information into a 'Synthesis-like' table
+```{r}
+# use ShortRead package to count number of reads before and after cutadapt command:
+out_R1 <- cbind(ShortRead::qa(raw_F_reads)[["readCounts"]][,"read", drop = FALSE],
+               ShortRead::qa(cut_F_reads)[["readCounts"]][,"read", drop = FALSE])
+out_R2 <- cbind(ShortRead::qa(raw_R_reads)[["readCounts"]][,"read", drop = FALSE],
+               ShortRead::qa(cut_R_reads)[["readCounts"]][,"read", drop = FALSE])
+
+# create and fill table with first outputs:
+SynthTab <- rbind.data.frame(out_R1,out_R2)
+colnames(SynthTab)[1:2] <- c("raw","cut")
+SynthTab$samples <- sapply(rownames(SynthTab),FUN = function(x) strsplit(x,split = "_")[[1]][1])
+SynthTab$reads <- sapply(rownames(SynthTab),FUN = function(x){ 
+  substr(strsplit(x,split = ".fastq")[[1]][1],nchar(strsplit(x,split = ".fastq")[[1]][1])-1,nchar(strsplit(x,split = ".fastq")[[1]][1]))
+  })
+# reorder:
+SynthTab <- SynthTab[,c(3,4,1,2)]
+```
+
+---
+
+**CHUNK 6**  
+Inspect quality profile (package ggplot2 required)  
+*N.B.: CRASH UNDER R version 4.1.0 (2021-05-18) 'Camp Pontanezen'*
+```{r}
+# Have a quick look only at the 2 first ones to have an idea:
+plotQualityProfile(cut_F_reads[1:2])
+plotQualityProfile(cut_R_reads[1:2])
+
+
+#### OPTIONAL : to get the quality profiles from all the reads (from all the samples) in PDF doc (in 'sum_up' folder) ####
+pdf(file.path(path_sum, "Read_quality_profile_aggregated.pdf"))
+  p <- plotQualityProfile(sample(cut_F_reads, replace = FALSE,
+                            size = ifelse(length(cut_F_reads) < 100, length(cut_F_reads), 100)),
+                     aggregate = TRUE)
+  p + ggplot2::labs(title = "Forward")
+  p <- plotQualityProfile(sample(cut_R_reads, replace = FALSE,
+                            size = ifelse(length(cut_R_reads) < 100, length(cut_R_reads), 100)),
+                     aggregate = TRUE)
+  p + ggplot2::labs(title = "Reverse")
+dev.off()
+```
+
+---
+
+**CHUNK 7**  
+Filtering the reads according to their quality, ambiguous nucleotides and trim reads end when quality tends to decrease
+```{r}
+# Create names for output files
+filt_F_reads <- file.path(path_filt, basename(raw_F_reads))
+filt_R_reads <- file.path(path_filt, basename(raw_R_reads))
+
+# assign names to samples
+names(filt_F_reads) <- sample_names
+names(filt_R_reads) <- sample_names
+
+# Think twice before copying next command
+# Check DADA2 official tutorial and the help of filterAndTrim() function for details about arguments
+# Here, according to the expected amplicon length we need to adapt truncLen for then be able 
+# to merge our reads together with a sufficient overlapping length ()
+out_2 <- filterAndTrim(cut_F_reads, filt_F_reads, cut_R_reads, filt_R_reads,
+                       truncLen = c(220,180), maxN = 0, maxEE = c(2,2), truncQ = 2,
+                       rm.phix = TRUE, compress = TRUE, multithread = TRUE)
+outFilt <- rbind(ShortRead::qa(filt_F_reads)[["readCounts"]][,"read", drop = FALSE],
+               ShortRead::qa(filt_R_reads)[["readCounts"]][,"read", drop = FALSE])
+
+#### OPTIONAL: add infos to the synthesis table and reformat it ####
+SynthTab <- merge(SynthTab,outFilt,by=0)
+rownames(SynthTab) <- SynthTab[,1]
+SynthTab <- SynthTab[,-1]
+colnames(SynthTab)[5] <- "filtered"
+```
+
+---
+
+**CHUNK 8**  
+Learn the error rates from our samples to then use it for sample inference
+```{r}
+error_F <- learnErrors(filt_F_reads, multithread = TRUE, randomize = TRUE)
+error_R <- learnErrors(filt_R_reads, multithread = TRUE, randomize = TRUE)
+
+#### OPTIONAL : to save the error rates estimations in a PDF doc (in 'sum_up' folder) ####
+pdf(file.path(path_sum, "Error_rates_learning.pdf"))
+  p <- plotErrors(error_F, nominalQ = TRUE)
+  p + ggplot2::labs(title = "Error Forward")
+  p <- plotErrors(error_R, nominalQ = TRUE)
+  p + ggplot2::labs(title = "Error Reverse")
+dev.off()
+```
+
+---
+
+**CHUNK 9**  
+Dereplication step - Sample inference and merging reads together.  
+Here we dereplicate to reduce processing times and then we perform the dada2 denoising algorithm following by the merging of the reads together.
+```{r}
+# At this point we will work with list, with samples as elements, containing the their relative outputs
+dada_F_reads <- list()
+dada_R_reads <- list()
+merged_reads <- list()
+SynthTab$uniq <- NA
+for (r in 1:length(sample_names)){
+
+  cat("Processing (",r,"/",length(sample_names),") :",sample_names[r],"\n")
+  
+  # Dereplication step:
+  derepF_tmp <- derepFastq(filt_F_reads[r], verbose=1) 
+  derepR_tmp <- derepFastq(filt_R_reads[r], verbose=1)
+
+  # Sample inference (denoising)
+  dada_F_reads[[sample_names[r]]] <- dada(derepF_tmp, err=error_F, multithread = TRUE, verbose = 1)  
+  dada_R_reads[[sample_names[r]]] <- dada(derepR_tmp, err=error_R, multithread = TRUE, verbose = 1)
+  
+  # Merging the reads together:
+  merged_reads[[sample_names[r]]] <- mergePairs(dadaF = dada_F_reads[[sample_names[r]]],
+                                                derepF = derepF_tmp,
+                                                dadaR = dada_R_reads[[sample_names[r]]],
+                                                derepR = derepR_tmp, verbose = 1)
+  
+  #### OPTIONAL, to fill Synthesis table ####
+  SynthTab[which(grepl(sample_names[r],SynthTab$samples) & SynthTab$reads=="R1"),"uniq"] <- length(derepF_tmp$uniques)
+  SynthTab[which(grepl(sample_names[r],SynthTab$samples) & SynthTab$reads=="R2"),"uniq"] <- length(derepR_tmp$uniques)
+  
+}
+
+#### OPTIONAL, but good to know (especially for big data) ####
+# If you want to save the list to continue the pipeline another day
+# 
+### saving the list as RDS-like file, run:
+# saveRDS(merged_reads, "<path>/merged_reads_chunk_9")
+# 
+### load the RDS file as list, run:
+# merged_reads <- readRDS("<path>/merged_reads_chunk_9")
+# 
+# N.B.: at this point if you want to have a break and reload the list another day, 
+# do not forget to load as well the different variable you will need to use (path, file names, Synthesis table: save and load, ...) and the packages as well!
+```
+
+---
+
+**CHUNK 10**  
+Optional, but interesting step to investigate: looking at the reads merging outputs.  
+```{r}
+# Let's check that!
+# build temporary dataframe for the check-up
+check_tmp <- matrix(nrow=length(merged_reads), ncol=5)
+check_tmp <- as.data.frame(check_tmp)
+colnames(check_tmp) <- c("minOverlap","ASV_number","ASV_abundance","ASV_number_prop","ASV_abundance_prop")
+
+j<-0
+
+# m value from 12(+1) (default overlapping length for DADA2 is 12) until 170(+1) (maximum length of reads we have, could logically not exceed that) J1 parameters here but it's ok for global screening
+for (m in 13:171){
+  j<-j+1
+  vec_numb <- vector()
+  vec_abun <- vector()
+  vec_numb_prop <- vector()
+  vec_abun_prop <- vector()
+
+  for (i in 1:length(merged_reads)){
+  
+    vec_abun[i] <- as.numeric(merged_reads[[i]] %>%
+                                filter(nmatch==m) %>%
+                                summarise(sum(abundance)))
+    
+    vec_numb[i] <- nrow(merged_reads[[i]] %>%
+                          filter(nmatch==m))
+    
+    vec_abun_prop[i] <- as.numeric(merged_reads[[i]] %>%
+                                filter(nmatch<m) %>%
+                                summarise(sum(abundance)))/sum(merged_reads[[i]]$abundance)*100
+    
+    vec_numb_prop[i] <- nrow(merged_reads[[i]] %>%
+                               filter(nmatch<m))/nrow(merged_reads[[i]])*100
+    }
+  check_tmp[j,1] <- m-1
+  check_tmp[j,2] <- sum(vec_numb)
+  check_tmp[j,3] <- sum(vec_abun)
+  check_tmp[j,4] <- mean(vec_numb_prop, na.rm=T)
+  check_tmp[j,5] <- mean(vec_abun_prop, na.rm=T)
+}
+# (not clean script, please don't judge)
+
+# plot result for a quick visual:
+check_tmp$txt_ab <- check_tmp$ASV_abundance
+check_tmp[check_tmp$txt_ab==0,"txt_ab"] <- NA
+
+png(file.path(path_sum, "Merged_reads_overlapping_length.png"),width = 1600, height = 680)
+ggplot(data=check_tmp, aes(x=minOverlap,y=ASV_abundance)) +
+  geom_bar(stat='identity') +
+  geom_text(aes(label=txt_ab), vjust=-0.3, size=3)
+
+
+#### If you want more stats / overview
+minov <- vector()
+maxov <- vector()
+meanov <- vector()
+sdov <- vector()
+for (i in 1:length(merged_reads)){
+    minov[i] <- min(merged_reads[[i]]$nmatch)
+    maxov[i] <- max(merged_reads[[i]]$nmatch)
+    meanov[i] <- mean(merged_reads[[i]]$nmatch)
+    sdov[i] <- sd(merged_reads[[i]]$nmatch)
+}
+
+## minimum over the minima
+min(minov)
+## maximum over the maxima
+max(maxov)
+## mean overlapping length 
+mean(meanov)
+```
+
+---
+
+**CHUNK 11**   
+Use previous investigation to 'clean' merged ASV and create the ASV table.
+```{r}
+# based on previous chunk, let's keep ASV with an overlapping length between "???"
+for (i in 1:length(merged_reads)){
+  merged_reads[[i]] <- merged_reads[[i]] %>% filter(nmatch>35 & nmatch<45)
+}
+
+# create from the list the sequence table:
+seqtab <- makeSequenceTable(merged_reads)
+
+# be curious:
+dim(seqtab) # number of samples * number of ASV
+table(nchar(getSequences(seqtab))) # length distribution of the ASV
+
+#### OPTIONAL: add infos to the synthesis table and reformat it ####
+SynthTab$merged <- NA
+for (i in sample_names){
+  SynthTab[which(grepl(i,SynthTab$samples)),"merged"] <- nrow(merged_reads[[i]])
+}
+```
+
+---
+
+**CHUNK 12**  
+Remove Chimera
+```{r}
+seqtab.nochim <- removeBimeraDenovo(seqtab, method="consensus", multithread=TRUE, verbose=TRUE)
+
+# never stop being curious:
+dim(seqtab.nochim) # number of samples * number of ASV (- chimera)
+table(nchar(getSequences(seqtab))) # length distribution of the ASV (- chimera)
+sum(seqtab.nochim)/sum(seqtab)*100 # % of kept ASV to have an idea of the chimera proportion
+
+
+#### OPTIONAL: add infos to the synthesis table and reformat it ####
+SynthTab$no_chimera <- NA
+for (i in sample_names){
+  SynthTab[which(grepl(i,SynthTab$samples)),"no_chimera"] <- length(which(seqtab.nochim[i,]>0))
+}
+```
+
+---
+
+**CHUNK 13**  
+Taxonomic assignation with DADA2:
+For the taxonomic assignation we will use here DADA2 command "assignTaxonomy" and keep assignation which are supported by a bootstrap of minimum 75
+```{r}
+#### assigning ASV to taxonomy ####
+tax <- assignTaxonomy(seqtab.nochim,
+                      "<path to reference library for DADA2 taxonomic assignation>",
+                      minBoot = 75,
+                      taxLevels = c("Kingdom","Phylum","Class","Order","Family","Genus","Genus_species"),
+                      outputBootstraps = TRUE, verbose = TRUE, multithread = TRUE)
+
+
+# define assignation table
+ass.tab <- as.data.frame(tax[["tax"]])
+```
+
+---
+
+Warning: the following of the script is now more a personal adaptation, at this point, the treatment from raw reads (raw FASTQ) until taxonomic assignation of the ASV is done. Following chunks provide thus an idea of how to process these outputs!
+
+
+**CHUNK 14**  
+Reformatting outputs:  
+-> save a FASTA file with \>asv{n} as identifier for each barcodes  
+-> save a matrix-community like as table  
+-> merge them to have both information in one dataframe
+```{r}
+library(ape) # for write.FASTA commands which allows to save sequences as FASTA files in the format I like
+library(Biostrings) # for DNAStringset
+
+#### Creating a FASTA file as output for final ASV ####
+# creates FASTA file from seqtable without chimera
+dna.seqs <- DNAStringSet(getSequences(seqtab.nochim))
+# the reads are (hopefully) in the same order in fasta and in seqtable
+# add asv{x} as identifiers for each sequences is then more convenient to deal with
+names(dna.seqs) <- paste0(rep("asv",length(dna.seqs)),seq(1:length(dna.seqs)))
+# save as fasta file
+write.FASTA(as.DNAbin(dna.seqs),paste0(path_results,"/resulting_ASV.fasta"))
+  
+#### Creating the matrix-community-like table with asv as rownames ####
+# add also "ASVx" to the sequences table
+ASV <- paste0(rep("asv",ncol(seqtab.nochim)),
+         seq(1:ncol(seqtab.nochim)))
+# add ASV as row
+seqtab.nochim <- rbind(seqtab.nochim,ASV)
+# save sequences table :
+write.table(seqtab.nochim,sep=";",quote=F,
+    paste0(path_results,"/seqtab_nochim.txt"))
+
+#### Reformat to have one complete table gathering all infos ####
+# reformat seqtab to fit with merging (thanks to ASV 'names')
+seqtab.ref <- as.data.frame(t(seqtab.nochim))
+
+### -> Choice 1 : barcodes as rownames (and keep ASV names in another field or delete, as you prefer)
+finalComplete_tab1 <- merge(ass.tab,seqtab.ref,by=0)
+rownames(finalComplete_tab1) <- finalComplete_tab1[,1]
+finalComplete_tab1 <- finalComplete_tab1[,-1]
+finalComplete_tab1[,8:(ncol(finalComplete_tab1)-1)] <- sapply(finalComplete_tab1[,8:(ncol(finalComplete_tab1)-1)], as.numeric)
+
+# and save it !
+write.table(finalComplete_tab1,
+              paste0(path_results,"/complete_assseq_table.txt"),
+              sep = ";",quote=F,row.names = T)
+
+### -> Choice 2: asv as rownames (and keep barcodes sequences in another field or delete, as you prefer)
+finalComplete_tab2 <- merge(ass.tab,seqtab.ref,by=0)
+rownames(finalComplete_tab2) <- finalComplete_tab2$ASV
+colnames(finalComplete_tab2)[1] <- "sequences"
+finalComplete_tab2 <- finalComplete_tab2[,-ncol(finalComplete_tab2)]
+finalComplete_tab2[,9:ncol(finalComplete_tab2)] <- sapply(finalComplete_tab2[,9:ncol(finalComplete_tab2)], as.numeric)
+
+# and save it!
+write.table(finalComplete_tab2,
+              paste0(path_results,"/complete_assseq_table.txt"),
+              sep = ";",quote=F,row.names = T)
+```
+
+---
+
+**CHUNK 15**  
+OPTIONAL: Check reads losses through the different steps of the pipeline
+```{r}
+#### fill the synthesis table with last infos ####
+SynthTab$assigned <- NA
+SynthTab$assigned_to_Sp <- NA
+for (i in sample_names){
+  SynthTab[which(grepl(i,SynthTab$samples)),"assigned"] <- length(finalComplete_tab2[which(finalComplete_tab2[[i]]>0),"Species"])
+  SynthTab[which(grepl(i,SynthTab$samples)),"assigned_to_Sp"] <- length(finalComplete_tab2[which(finalComplete_tab2[[i]]>0 & !is.na(finalComplete_tab2$Species)),"Species"])
+}
+
+#### draw a (cool!) summary plot ####
+library(plotly)
+library(reshape2)
+
+melted_SynthTab <- melt(SynthTab)
+
+p <- plot_ly(melted_SynthTab, x = ~variable, y = ~value, symbol = ~reads, color = ~samples,
+        symbols = c("o","x"), type = 'scatter', mode = 'lines+markers')
+
+# save it and make it shareable:
+htmlwidgets::saveWidget(p, paste0(path_sum,"/plotly_reads_losses.html"), selfcontained = F, libdir = "lib")
+```
+
+---
+
+**CHUNK 16**
+ASV treatments - 'Normalization' - relative abundances
+```{r}
+#### make sure what we want to be as numeric data are numeric data ####
+finalComplete_tab2[,9:ncol(finalComplete_tab2)] <- sapply(finalComplete_tab2[,9:ncol(finalComplete_tab2)],
+                                                          as.numeric)
+
+#### In all samples, remove ASV which presents an abundance below 50 ####
+finalComplete_tab_b50 <- finalComplete_tab2
+for (i in colnames(finalComplete_tab_b50)[9:ncol(finalComplete_tab_b50)]){
+  finalComplete_tab_b50[[i]][which(finalComplete_tab_b50[[i]]<50,arr.ind=T)] <- 0
+}
+finalComplete_tab_b50 <- finalComplete_tab_b50[which(rowSums(finalComplete_tab_b50[,9:ncol(finalComplete_tab_b50)])>0),]
+
+#### Convert to relative abundance ####
+for (i in colnames(finalComplete_tab_b50)[9:ncol(finalComplete_tab_b50)]){
+    finalComplete_tab_b50[,i] <- finalComplete_tab_b50[,i]/sum(finalComplete_tab_b50[,i], na.rm = T)*100
+}
+
+#### Gather the corresponding Species together and sum they relative abundance ####
+# removing different fields : sequences
+finalComplete_tab_b50 <-  finalComplete_tab_b50[,-1]
+
+finalComplete_tab_b50 <-  finalComplete_tab_b50 %>%
+  gather(key = variable, value = value, colnames(finalComplete_tab_b50)[8:ncol(finalComplete_tab_b50)]) %>%
+  group_by(Kingdom, Phylum, Class, Order, Family, Genus, Species, variable) %>%
+  summarize(sum = sum(value)) %>%
+  spread(variable, sum)
+```
